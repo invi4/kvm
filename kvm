@@ -1,0 +1,159 @@
+#!/bin/sh
+# INVI4 — acceso inicial a un Proxmox recién instalado, desde una consola KVM.
+#
+# Esto corre ANTES que todo: instala Tailscale y une el nodo al tailnet **con el tag del sitio**, para
+# poder seguir el despliegue por SSH (cómodo, con copy-paste y tmux) en vez de tipear en una consola web.
+#
+# Uso (una sola línea, sin comillas, se puede pegar en cualquier consola):
+#
+#   apt-get update -qq; apt-get install -y -qq curl; \
+#   curl -fsSL https://raw.githubusercontent.com/invi4/kvm/main/kvm | TSKEY=tskey-auth-XXXX sh -s <cliente>
+#
+# La key va por entorno (`TSKEY=...` adelante del `sh`): es lo único que no se malinterpreta en una
+# consola web. **Sin la key no hace nada** — por eso este archivo puede ser público.
+#
+# Es POSIX (`sh -n` limpio) y **standalone**: no importa nada del repo, porque en este momento no hay
+# repo. Si algo no se entiende, lo dice ANTES de tocar el sistema.
+#
+# Un nodo con tag **no expira**: sin el tag, Tailscale le pone vencimiento a la llave y el sitio se
+# pierde sin avisar (pasó: se entró sólo por KVM durante horas).
+
+set -e
+
+CLIENTE="$1"
+TSKEY="${TSKEY:-}"
+
+echo ""
+echo "============================================================"
+echo "INVI4 - acceso inicial por Tailscale"
+echo "============================================================"
+echo ""
+
+# ---------- 1. Lo que entendí, ANTES de tocar nada ----------
+if [ -z "$CLIENTE" ]; then
+  echo "  FALTA el sitio. La linea tiene que terminar en:  sh -s <cliente>"
+  exit 1
+fi
+case "$CLIENTE" in
+  *[!a-z0-9-]*|"")
+    echo "  El sitio '$CLIENTE' no parece un nombre valido (minusculas, numeros y guiones)."
+    echo "  Si la consola masticó el texto, volvé a pegar la linea."
+    exit 1 ;;
+esac
+
+# Lo que entendí, ANTES de validar nada: si la consola masticó el sitio, se ve acá.
+TAG="tag:$CLIENTE-host"
+echo "  sitio:   $CLIENTE"
+echo "  nodo:    $CLIENTE-host"
+echo "  tag:     $TAG   (un nodo con tag NO expira)"
+
+if [ -z "$TSKEY" ]; then
+  echo ""
+  echo "  FALTA la auth key (el resto de la línea se leyó bien)."
+  echo "  La linea empieza con:  curl -fsSL <url> | TSKEY=tskey-auth-... sh -s $CLIENTE"
+  echo "  (Se genera desde tu notebook: ./scripts/crear-authkey.sh $CLIENTE)"
+  exit 1
+fi
+case "$TSKEY" in
+  tskey-auth-*) : ;;
+  *)
+    echo ""
+    echo "  Eso no parece una auth key: tienen que empezar con tskey-auth-"
+    echo "  (tskey-api- es la de la API: esa NO va acá)."
+    exit 1 ;;
+esac
+echo "  key:     $(printf '%s' "$TSKEY" | cut -c1-12)... (largo $(printf '%s' "$TSKEY" | wc -c))"
+echo ""
+
+if [ "$(id -u)" != "0" ]; then
+  echo "  Esto tiene que correr como root (en la consola del Proxmox ya lo sos)."
+  exit 1
+fi
+
+# ---------- 2. Lo mínimo para poder seguir ----------
+# Un Proxmox recién instalado puede no tener `curl`, y sin `curl` no hay nada: ni Tailscale ni el resto.
+# En la línea se instala antes, pero acá también se comprueba (el script se puede correr suelto).
+echo "--> Dependencias"
+if command -v curl >/dev/null 2>&1; then
+  echo "    curl: ya está"
+else
+  echo "    curl: falta, instalando..."
+  # `;` y no `&&`: en un Proxmox sin suscripción, `apt-get update` sale con error (el repo enterprise
+  # devuelve 401) y con `&&` el `install` no correría nunca. El `|| true` es por el mismo motivo.
+  apt-get update -qq || true
+  if apt-get install -y -qq curl; then
+    echo "    curl: instalado"
+  else
+    echo ""
+    echo "  No pude instalar curl (¿la red del cliente no llega a los repos de Debian?)."
+    echo "  Sin curl no puedo seguir desde acá. A mano:"
+    echo ""
+    echo "    apt-get update || true"
+    echo "    apt-get install -y curl"
+    echo ""
+    exit 1
+  fi
+fi
+
+# ---------- 3. Tailscale ----------
+echo "--> Tailscale"
+if command -v tailscale >/dev/null 2>&1; then
+  echo "    ya está instalado"
+else
+  echo "    instalando..."
+  if ! curl -fsSL https://tailscale.com/install.sh | sh; then
+    echo ""
+    echo "  No pude instalarlo (¿la red del cliente bloquea la salida?). A mano son dos lineas:"
+    echo ""
+    echo "    curl -fsSL https://tailscale.com/install.sh | sh"
+    echo "    tailscale up --auth-key=$TSKEY --hostname=$CLIENTE-host --accept-dns=false --advertise-tags=$TAG"
+    echo ""
+    exit 1
+  fi
+fi
+
+# ---------- 4. Unir el nodo ----------
+echo "--> Uniendo el nodo al tailnet"
+YA=$(tailscale status --peers=false 2>/dev/null | head -1 || true)
+if printf '%s' "$YA" | grep -q "$CLIENTE-host"; then
+  echo "    ya estaba como $CLIENTE-host"
+else
+  tailscale up --auth-key="$TSKEY" --hostname="$CLIENTE-host" --accept-dns=false \
+    --advertise-tags="$TAG" || {
+      echo ""
+      echo "  El 'tailscale up' falló. La causa más común es que el tag no esté declarado en el"
+      echo "  policy del tailnet ('requested tags are invalid'):"
+      echo ""
+      echo "    tailscale/policy.hujson -> tagOwners: \"$TAG\": [\"autogroup:admin\"]"
+      echo ""
+      echo "  Eso se arregla desde tu notebook (esta en el repo) y después se repite esta linea."
+      exit 1
+    }
+fi
+
+# ---------- 5. Verificar ----------
+echo "--> Verificando"
+IP=$(tailscale ip -4 2>/dev/null | head -1 || true)
+if [ -z "$IP" ]; then
+  echo "    todavía no tengo IP del tailnet. Mirá:  tailscale status"
+  exit 1
+fi
+echo "    IP del tailnet: $IP"
+
+if tailscale status --json 2>/dev/null | grep -q "$TAG"; then
+  echo "    tag aplicado:   $TAG   (sin expiración de llave)"
+else
+  echo "    AVISO: no veo el tag $TAG en el estado del nodo."
+  echo "    Revisalo en el panel de Tailscale y, si falta, corré de nuevo esta linea."
+fi
+
+# ---------- 6. Listo: de acá en adelante, por SSH ----------
+echo ""
+echo "============================================================"
+echo "Listo. Seguí por SSH desde tu notebook:"
+echo ""
+echo "    ssh root@$CLIENTE-host"
+echo ""
+echo "Y de ahí en adelante, el runbook: docs/tareas/despliegue-seguro.md"
+echo "============================================================"
+echo ""
