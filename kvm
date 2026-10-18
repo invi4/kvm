@@ -7,7 +7,9 @@
 # Uso (una sola línea, sin comillas, se puede pegar en cualquier consola):
 #
 #   apt-get update -qq; apt-get install -y -qq curl; \
-#   curl -fsSL https://raw.githubusercontent.com/invi4/kvm/main/kvm | TSKEY=tskey-auth-XXXX sh -s <cliente>
+#   curl -fsSL https://raw.githubusercontent.com/invi4/kvm/main/kvm | sh
+#
+#   Te va a pedir el sitio y la key (esta última sin mostrarla). No hace falta pasarlos en la línea.
 #
 # La key va por entorno (`TSKEY=...` adelante del `sh`): es lo único que no se malinterpreta en una
 # consola web. **Sin la key no hace nada** — por eso este archivo puede ser público.
@@ -41,6 +43,34 @@ case "$CLIENTE" in
     exit 1 ;;
 esac
 
+# ---------- Lo que no vino, se pregunta ----------
+# La línea que se pega en la consola KVM va **sin** el sitio y **sin** la key: así no queda nada en el
+# historial de la shell ni en `ps`, y no hay placeholders que alguien pegue sin reemplazar.
+#
+# Ojo con `/dev/tty` ✗: el script llega por un pipe (`curl … | sh`), así que su **stdin es el script** —
+# un `read` sin redirección se comería la línea siguiente en vez de esperar al operador. Se lee de la
+# terminal, que en la consola KVM existe siempre.
+# Sólo se pregunta si hay una terminal de verdad. `[ -t 0 ]` no sirve (el stdin del script es el pipe de
+# `curl … | sh`); `[ -t 1 ]` sí: en la consola KVM la salida es una terminal, y en una suite o en el CI es
+# un pipe. Sin esta guarda, un test que corre el script sin pasar la key se quedaba **colgado** esperando ✓.
+if [ -t 1 ] && [ -r /dev/tty ]; then
+  if [ -z "${CLIENTE:-}" ]; then
+    printf '  cliente (el nombre del sitio): '
+    read -r CLIENTE < /dev/tty || CLIENTE=""
+  fi
+  if [ -z "${TSKEY:-}" ]; then
+    printf '  auth key de Tailscale (no se ve mientras pegás): '
+    stty -echo < /dev/tty 2>/dev/null || true
+    read -r TSKEY < /dev/tty || TSKEY=""
+    stty echo < /dev/tty 2>/dev/null || true
+    printf '\n'
+  fi
+fi
+if [ -z "$CLIENTE" ]; then
+  echo "  No hay sitio: sin eso no sé qué tag ponerle al nodo."
+  exit 1
+fi
+
 # Lo que entendí, ANTES de validar nada: si la consola masticó el sitio, se ve acá.
 TAG="tag:$CLIENTE-host"
 echo "  sitio:   $CLIENTE"
@@ -48,10 +78,12 @@ echo "  nodo:    $CLIENTE-host"
 echo "  tag:     $TAG   (un nodo con tag NO expira)"
 
 if [ -z "$TSKEY" ]; then
+  # Respaldo: sin terminal (o si se pegó y no leyó nada) queda esta salida.
   echo ""
-  echo "  FALTA la auth key (el resto de la línea se leyó bien)."
-  echo "  La linea empieza con:  curl -fsSL <url> | TSKEY=tskey-auth-... sh -s $CLIENTE"
-  echo "  (Se genera desde tu notebook: ./scripts/crear-authkey.sh $CLIENTE)"
+  echo "  No pude leer la auth key (¿no hay terminal? ¿se pegó vacía?)."
+  echo "  Se genera desde tu notebook: ./scripts/crear-authkey.sh $CLIENTE"
+  echo "  Y se puede pasar por entorno, sin que quede en el historial de esta sesión:"
+  echo "    read -rs TSKEY && curl -fsSL <url> | TSKEY=\"$TSKEY\" sh -s $CLIENTE"
   exit 1
 fi
 case "$TSKEY" in
